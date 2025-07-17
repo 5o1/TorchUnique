@@ -1,5 +1,5 @@
 import pytorch_lightning as pl
-from torchunique import sharedobject
+import torchunique
 import torch
 from torch import distributed as dist
 import os
@@ -27,7 +27,7 @@ class RandomDataset(Dataset):
 class TestLightningModule(pl.LightningModule):
     def __init__(self):
         super().__init__()
-        self.cache_dict: dict = sharedobject.Unique(dict())
+        self.cache_dict: dict = torchunique.Unique(dict())
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
         self.cache_dict.setdefault("fname", []).append(f"rank{dist.get_rank()} batch_idx{batch_idx:02}")

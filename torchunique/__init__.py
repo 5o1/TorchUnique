@@ -1,3 +1,3 @@
-from .sharedobject import DistInitProcessGroupTracker
+from .sharedobject import DistInitProcessGroupTracker, Unique
 
 DistInitProcessGroupTracker.patch()
