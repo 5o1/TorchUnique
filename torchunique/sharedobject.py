@@ -10,7 +10,7 @@ import atexit
 class DistInitProcessGroupTracker:
     """
     A class to monkey patch `dist.init_process_group` with a tracker that captures
-    the input arguments (`rank` and `init_method`) for RPC initialization.  
+    the input arguments (`rank` and `init_method` and `device_id`) for RPC initialization.  
     It is useful in ddp strategy in ONE single node.  
     """
 
@@ -43,7 +43,7 @@ class DistInitProcessGroupTracker:
         """
         Monkey patch `dist.init_process_group` to use the tracker.  
         This function should be executed when the package is initialized.  
-        This method can only be called once. Subsequent calls will raise a RuntimeError.  
+        This method can only be called once. Subsequent calls will raise a `RuntimeError`.  
         """
         if cls._patch_applied:
             raise RuntimeError("InitProcessGroupTracker.patch can only be applied once.")
@@ -139,10 +139,16 @@ class TorchRpcUtils:
 
     @staticmethod
     def rpc_get(rank: int, context_id: str) -> rpc.RRef:
+        """
+        Get `RRef` from remote distribution queue.
+        """
         rref = rpc.remote(TorchRpcUtils.rank_0_worker_name, TorchRpcUtils.rpc_get_impl, args = (rank, context_id), timeout = 30)
         return rref
     @staticmethod
     def rpc_set(rank: int, context_id: str, obj: object):
+        """
+        Add objects to the distribution queue. Only allowed to be called by `rank0`. 
+        """
         TorchRpcUtils.buffer[context_id] = (obj, {i for i in range(dist.get_world_size()) if i != rank})
     
     @staticmethod
@@ -158,12 +164,15 @@ class TorchRpcUtils:
 
     @staticmethod
     def rref_wait(rref: rpc.RRef):
+        """
+        Wait for all requests bound to this `RRef` object to complete.
+        """
         rpc.rpc_sync(rref.owner(), hasattr, (rref, "__name__"))
 
     @staticmethod
     def remote_call_sync(rref: rpc.RRef, func_name: str, *args, **kwargs):
         """
-        A remote function call to the object referenced by the RRef. Return Results.
+        A remote function call to the object referenced by the RRef. Block the target rank and wait for the RRef to be returned.
         """
         response = rpc.remote(rref.owner(), TorchRpcUtils.run_impl, args=(rref, func_name, *args, *kwargs), timeout=30)
         TorchRpcUtils.rref_wait(response)
@@ -172,7 +181,7 @@ class TorchRpcUtils:
     @staticmethod
     def remote_call(rref: rpc.RRef,func_name:str,  *args, **kwargs):
         """
-        A remote function call to the object referenced by the RRef. Return RRef.
+        A remote function call to the object referenced by the RRef. Return RRef. Data consistency cannot be ensured. Manual `rref_wait()` synchronization is required.
         """
         return rpc.remote(rref.owner(), TorchRpcUtils.run_impl, args=(rref, func_name, *args, *kwargs), timeout=30)
 
@@ -182,6 +191,9 @@ class TorchRpcUtils:
 
     @staticmethod
     def make_context_id(extend = "", max_depth=5) -> str:
+        """
+        Generate a context id that identifies the `obj` to prevent possible confusion in the `obj` distribution.
+        """
         stack = inspect.stack()
         call_chain = [extend]
         for frame in stack[:max_depth]:
@@ -196,25 +208,31 @@ class TorchRpcUtils:
         return context_id
 
 class Unique(TorchRpcUtils):
+    """
+    A wrapper class for managing distributed objects across PyTorch ranks using RPC.
+    Ensures that an object is distributed uniquely across ranks and provides utility
+    methods for accessing, synchronizing, and retrieving the object.
+
+    Attributes:
+        _obj (rpc.RRef): The distributed reference to the wrapped object.
+        is_distributed (bool): Indicates whether the object is distributed across ranks.
+    """
     _obj: rpc.RRef
     is_distributed: bool
-    """
-    A function to ensure that the object is unique across distributed ranks.  
-    It initializes the object on rank 0 and retrieves it on other ranks.  
-    The context_depth parameter controls how many frames to consider for generating a unique context ID.
-    
-    Args:
-        obj (object): The object to be made unique.
-        context_depth (int): The depth of the call stack to consider for generating a unique context ID.
-    
-    Returns:
-        object: The unique object across distributed ranks.
-    
-    Raises:
-        ValueError: If the input object is None.
-        RuntimeError: If the object could not be initialized or retrieved successfully.
-    """
+
     def __init__(self,obj: object, context_depth=5, dont_distribute: bool = False, sync: bool = True):
+        """
+        Initializes the Unique instance.
+
+        Args:
+            obj (object): The object to distribute.
+            context_depth (int): Depth for generating the context ID.
+            dont_distribute (bool): If True, skips distribution and keeps the object local.
+            sync (bool): If True, ensures synchronous operations.
+
+        Raises:
+            ValueError: If `obj` is None.
+        """
         self.context_id = self.make_context_id(obj.__class__.__name__, context_depth)
         self.is_distributed = False
         self.sync = sync
@@ -241,6 +259,10 @@ class Unique(TorchRpcUtils):
     def rpc_distribute(self):
         """
         Distributes the object across distributed ranks, ensuring that it is unique.
+
+        Raises:
+            ValueError: If the object is None and cannot be distributed.
+            RuntimeError: If the object cannot be retrieved on a rank.
         """
         if not dist.is_initialized():
             warnings.warn("Use Unique without distributed context. This will not ensure uniqueness across ranks.")
@@ -256,12 +278,12 @@ class Unique(TorchRpcUtils):
         if not self.is_rpc_initialized():
             self.rpc_init(rank)
 
-        # Step0: rank0 prepares resources
+        # Step0: rank0 prepare resources
         if rank == 0:
             self.rpc_set(rank, self.context_id, self._obj)
         self.barrier()
 
-        # Step1: rank# gets resources
+        # Step1: rank# get resources
         if rank != 0:
             self._obj = self.rpc_get(rank, self.context_id)
 
@@ -272,14 +294,29 @@ class Unique(TorchRpcUtils):
         self.is_distributed = True
 
     def close(self):
+        """
+        Closes the RPC context if initialized, ensuring proper cleanup.
+        """
         if self.is_rpc_initialized():
             self.rpc_close()
 
     def wait(self):
+        """
+        Waits for the completion of any pending RPC operations for the object.
+        """
         if self.isinstance_rref(self._obj):
             self.rref_wait(self._obj)
 
     def to_here(self):
+        """
+        Retrieves the actual object from the RRef if distributed.
+
+        Returns:
+            object: The wrapped object.
+
+        Raises:
+            TimeoutError: If the object cannot be retrieved within the timeout.
+        """
         if self.isinstance_rref(self._obj):
             if self.sync:
                 self.rref_wait(self._obj)
@@ -287,6 +324,16 @@ class Unique(TorchRpcUtils):
         return self._obj
 
     def __call__(self, *args, **kwargs):
+        """
+        Calls the wrapped object if it is callable.
+
+        Args:
+            *args: Positional arguments for the callable.
+            **kwargs: Keyword arguments for the callable.
+
+        Returns:
+            Unique: A new Unique instance wrapping the result.
+        """
         if not dist.is_initialized():
             return Unique(self._obj(*args, **kwargs), dont_distribute=True, sync = self.sync)
 
@@ -301,6 +348,15 @@ class Unique(TorchRpcUtils):
         return Unique(self._obj(*args, **kwargs), dont_distribute=True, sync=self.sync)
 
     def __getattr__(self, name: str):
+        """
+        Accesses attributes of the wrapped object.
+
+        Args:
+            name (str): The name of the attribute.
+
+        Returns:
+            Unique: A new Unique instance wrapping the retrieved attribute.
+        """
         if not dist.is_initialized():
             return Unique(getattr(self._obj, name), dont_distribute=True)
         
