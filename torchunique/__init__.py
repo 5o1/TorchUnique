@@ -1,0 +1,3 @@
+from .sharedobject import DistInitProcessGroupTracker
+
+DistInitProcessGroupTracker.patch()
