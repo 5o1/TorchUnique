@@ -256,12 +256,12 @@ class Unique(TorchRpcUtils):
         if not self.is_rpc_initialized():
             self.rpc_init(rank)
 
-        # Step0: rank0 prepare resources
+        # Step0: rank0 prepares resources
         if rank == 0:
             self.rpc_set(rank, self.context_id, self._obj)
         self.barrier()
 
-        # Step1: rank# get resources
+        # Step1: rank# gets resources
         if rank != 0:
             self._obj = self.rpc_get(rank, self.context_id)
 
